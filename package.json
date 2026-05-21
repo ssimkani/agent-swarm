@@ -1,15 +1,35 @@
 {
   "name": "agent-swarm",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "mastra dev",
-    "build": "mastra build",
-    "start": "mastra start"
+  "description": "A multi-mode AI agent harness with router, dynamic review, and extension system",
+  "main": "dist/harness.js",
+  "bin": {
+    "agent": "bin/agent.js"
   },
-  "keywords": [],
+  "exports": {
+    ".": "./dist/harness.js",
+    "./config": "./dist/config.js",
+    "./models": "./dist/models.js",
+    "./agents": "./dist/agents/index.js"
+  },
+  "files": [
+    "dist/",
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "dev": "tsx --watch src/cli.ts",
+    "start": "node bin/agent.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "mastra",
+    "cli",
+    "router"
+  ],
   "author": "",
   "license": "ISC",
   "type": "module",
@@ -18,17 +38,14 @@
   },
   "dependencies": {
     "@mastra/core": "^1.36.0",
-    "@mastra/duckdb": "^1.4.0",
-    "@mastra/evals": "^1.2.2",
     "@mastra/libsql": "^1.11.1",
-    "@mastra/loggers": "^1.1.1",
     "@mastra/memory": "^1.19.0",
-    "@mastra/observability": "^1.13.0",
+    "picocolors": "^1.1.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "mastra": "^1.10.0",
+    "tsx": "^4.22.3",
     "typescript": "^6.0.3"
   }
 }
