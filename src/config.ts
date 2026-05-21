@@ -27,7 +27,7 @@ const McpServerSchema = z.object({
   /** Arguments forwarded to the command. */
   args: z.array(z.string()).default([]),
   /** Optional extra environment variables for the server process. */
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
 });
 
 /**
@@ -46,8 +46,9 @@ const ConfigSchema = z.object({
     create_environment: z.string().optional(),
   }).default({}),
 
+
   /** Named MCP servers available to agents that opt in. */
-  mcpServers: z.record(McpServerSchema).default({}),
+  mcpServers: z.record(z.string(), McpServerSchema).default({}),
 
   /**
    * Tool-category permission policies.
@@ -61,7 +62,7 @@ const ConfigSchema = z.object({
     edit: PermissionPolicySchema.default('ask'),
     execute: PermissionPolicySchema.default('ask'),
     mcp: PermissionPolicySchema.default('ask'),
-  }).default({}),
+  }),
 
   /** Root directory where user-authored extension agents/tools live. */
   extensionsDir: z.string().default(

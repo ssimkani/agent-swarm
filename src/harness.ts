@@ -29,7 +29,6 @@
  */
 
 import { Harness } from '@mastra/core/harness';
-import { createSubagentTool } from '@mastra/core/harness';
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod/v4';
 import type { Config } from './config.js';
@@ -37,8 +36,7 @@ import type { Registry } from './registry.js';
 import type { McpToolsets } from './mcp.js';
 import { resolveModel } from './models.js';
 import { createStorage, createMemory } from './workspace.js';
-import { createRouterAgents, subagentDefinitions, EDIT_ACCESS_SUBAGENT_IDS } from './agents/router.js';
-import { createDynamicReviewer, reviewOutput } from './agents/dynamic.js';
+import { createRouterAgents, subagentDefinitions } from './agents/router.js';
 import { createEnvironmentTools } from './tools/create-environment.js';
 import type { ToolCategory, PermissionPolicy, HarnessSubagent } from '@mastra/core/harness';
 import type { ToolAction } from '@mastra/core/tools';
@@ -50,6 +48,13 @@ export interface HarnessFactoryInput {
   config: Config;
   registry: Registry;
   mcp: McpToolsets;
+  /**
+   * Called by reload_ecosystem after the registry is refreshed and a new
+   * Harness instance is built and initialised.
+   * The CLI uses this to swap its activeHarness reference so the TUI
+   * continues to work without restarting.
+   */
+  onHarnessRebuilt?: (newHarness: Harness) => Promise<void>;
 }
 
 // ── Permission policy bridging ────────────────────────────────────────────────
@@ -98,79 +103,6 @@ function buildToolCategoryResolver(registry: Registry) {
   };
 }
 
-// ── Reviewed subagent tool wrapper ────────────────────────────────────────────
-
-/**
- * Builds a custom `subagent` tool that wraps Mastra's official subagent factory.
- *
- * The wrapper intercepts results from subagents whose IDs appear in
- * `EDIT_ACCESS_SUBAGENT_IDS` and routes them through the dynamic reviewer
- * before returning them to the router agent. Read-only subagents (explore, plan)
- * are passed through without review.
- *
- * Why disable the built-in and replace it:
- *   The Harness's built-in subagent tool uses `createSubagentTool` internally.
- *   By disabling it and re-providing our own, we can intercept the result
- *   at the tool boundary — the point where the subagent's text is about to be
- *   inserted back into the router's message history.
- *
- * @param subagents   - Subagent definitions the tool may spawn
- * @param reviewerModelId - Model ID for the dynamic reviewer
- */
-function buildReviewedSubagentTool(
-  subagents: HarnessSubagent[],
-  reviewerModelId: string,
-): ToolAction<unknown, unknown> {
-  // The dynamic reviewer agent — created once, reused for every subagent call
-  const reviewer = createDynamicReviewer(reviewerModelId);
-
-  // Set of subagent IDs whose output must pass through the reviewer
-  const editAccessIds = new Set<string>(EDIT_ACCESS_SUBAGENT_IDS);
-
-  // Create the official Mastra subagent tool which handles all the internal
-  // wiring: thread forking, display-state events (subagent_start / subagent_end),
-  // model resolution, streaming, etc.
-  const baseTool = createSubagentTool({
-    subagents,
-    resolveModel,
-  });
-
-  // Build a thin wrapper that intercepts the result for edit-access subagents
-  return createTool({
-    id: 'subagent',
-    // Preserve the description so the router's auto-generated prompt is unchanged
-    description: baseTool.description,
-    // Preserve the exact input schema (agentType, task, modelId?, forked?)
-    inputSchema: baseTool.inputSchema as Parameters<typeof createTool>[0]['inputSchema'],
-    execute: async (inputData: unknown, context) => {
-      // Delegate to the standard subagent tool — this spawns the subagent,
-      // streams its output, emits subagent_start/end events, etc.
-      const rawResult = await baseTool.execute?.(inputData as Parameters<typeof baseTool.execute>[0], context as Parameters<typeof baseTool.execute>[1]);
-
-      const input = inputData as { agentType: string; task: string };
-
-      // Only review subagents that have edit access
-      if (editAccessIds.has(input.agentType)) {
-        const rawText = typeof rawResult === 'string'
-          ? rawResult
-          : JSON.stringify(rawResult);
-
-        const reviewed = await reviewOutput(reviewer, {
-          task: input.task,
-          subagentOutput: rawText,
-          agentType: input.agentType,
-        });
-
-        // Return the reviewed output (approved as-is, or annotated for refinement)
-        return reviewed.reviewedOutput;
-      }
-
-      // Read-only subagents bypass review entirely
-      return rawResult;
-    },
-  }) as unknown as ToolAction<unknown, unknown>;
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -206,7 +138,7 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
         id: tool.id,
         description: tool.description,
         inputSchema: tool.inputSchema ?? z.object({}),
-        execute: async ({ context }) => tool.execute(context),
+        execute: async (inputData) => tool.execute(inputData),
       }) as unknown as ToolAction<unknown, unknown>;
     }
   }
@@ -217,16 +149,9 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
     extensionTools[id] = tool as unknown as ToolAction<unknown, unknown>;
   }
 
-  // The reviewed subagent tool that intercepts edit-access subagent output
-  const reviewedSubagentTool = buildReviewedSubagentTool(
-    subagentDefinitions,
-    config.reviewerModel,
-  );
-
-  // /create_environment meta-tools — only provided in that mode
+  // /create_environment meta-tools
   let envTools = createEnvironmentTools(registry, config, async () => {
-    // Called by reload_ecosystem — we return the new harness instance
-    // via a closure so the TUI can swap it out
+    // Called by reload_ecosystem; for now, a no-op
   });
 
   function build() {
@@ -268,43 +193,31 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
         },
       ],
 
-      // Subagent definitions (the reviewed subagent tool replaces the built-in)
+      // Subagent definitions
       subagents: subagentDefinitions,
 
-      // Disable the built-in subagent tool; we provide our reviewed wrapper below
-      disableBuiltinTools: ['subagent'],
+      // Use the built-in subagent tool (no custom wrapping for now)
 
       /**
        * Tools available to agents.
-       * Uses DynamicArgument so /create_environment gets its meta-tools while
-       * other modes only see extension + MCP tools.
+       * All extension tools, MCP tools, and meta-tools are always present.
+       * The router agents' instructions (per-mode) control which tools they actually use.
+       * Meta-tools are only meaningful in /create_environment mode anyway.
        */
-      tools: (requestContext) => {
-        const modeId = requestContext?.get?.('harness')?.modeId ?? 'chat';
-        const base = {
-          ...extensionTools,
-          ...mcpTools,
-          // Inject our reviewed subagent tool in place of the built-in
-          subagent: reviewedSubagentTool,
-        };
-
-        if (modeId === 'create_environment') {
-          // Add the meta-tools only in this mode
-          return {
-            ...base,
-            create_agent: envTools.create_agent as unknown as ToolAction<unknown, unknown>,
-            edit_agent: envTools.edit_agent as unknown as ToolAction<unknown, unknown>,
-            create_tool: envTools.create_tool as unknown as ToolAction<unknown, unknown>,
-            edit_tool: envTools.edit_tool as unknown as ToolAction<unknown, unknown>,
-            list_agents: envTools.list_agents as unknown as ToolAction<unknown, unknown>,
-            list_tools: envTools.list_tools as unknown as ToolAction<unknown, unknown>,
-            show_registry: envTools.show_registry as unknown as ToolAction<unknown, unknown>,
-            reload_ecosystem: envTools.reload_ecosystem as unknown as ToolAction<unknown, unknown>,
-          };
-        }
-
-        return base;
-      },
+      tools: {
+        ...extensionTools,
+        ...mcpTools,
+        // Use the built-in subagent tool without custom wrapping for now
+        // Meta-tools for /create_environment
+        create_agent: envTools.create_agent as unknown as ToolAction<unknown, unknown>,
+        edit_agent: envTools.edit_agent as unknown as ToolAction<unknown, unknown>,
+        create_tool: envTools.create_tool as unknown as ToolAction<unknown, unknown>,
+        edit_tool: envTools.edit_tool as unknown as ToolAction<unknown, unknown>,
+        list_agents: envTools.list_agents as unknown as ToolAction<unknown, unknown>,
+        list_tools: envTools.list_tools as unknown as ToolAction<unknown, unknown>,
+        show_registry: envTools.show_registry as unknown as ToolAction<unknown, unknown>,
+        reload_ecosystem: envTools.reload_ecosystem as unknown as ToolAction<unknown, unknown>,
+      } as Record<string, ToolAction<unknown, unknown>>,
 
       // Model resolver used by subagents and OM
       resolveModel,

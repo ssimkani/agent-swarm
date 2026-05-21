@@ -74,20 +74,20 @@ export function createEnvironmentTools(
       /** Optional model override; falls back to config.model if omitted. */
       defaultModel: z.string().optional().describe('Model ID (uses harness default if omitted)'),
     }),
-    execute: async ({ context }) => {
+    execute: async (inputData) => {
       ensureDir(agentsDir);
-      const filePath = join(agentsDir, `${context.name}.ts`);
+      const filePath = join(agentsDir, `${inputData.name}.ts`);
       if (existsSync(filePath)) {
-        return { success: false, message: `Agent "${context.name}" already exists. Use edit_agent to modify it.` };
+        return { success: false, message: `Agent "${inputData.name}" already exists. Use edit_agent to modify it.` };
       }
       const source = renderAgentTemplate(
-        context.name,
-        context.description,
-        context.instructions,
-        context.defaultModel ?? config.model,
+        inputData.name,
+        inputData.description,
+        inputData.instructions,
+        inputData.defaultModel ?? config.model,
       );
       writeFileSync(filePath, source, 'utf8');
-      return { success: true, path: filePath, message: `Created agent "${context.name}". Call reload_ecosystem to activate it.` };
+      return { success: true, path: filePath, message: `Created agent "${inputData.name}". Call reload_ecosystem to activate it.` };
     },
   });
 
@@ -102,32 +102,32 @@ export function createEnvironmentTools(
       field: z.enum(['instructions', 'model', 'description']).describe('Which field to update'),
       value: z.string().describe('New value for the field'),
     }),
-    execute: async ({ context }) => {
-      const filePath = join(agentsDir, `${context.name}.ts`);
+    execute: async (inputData) => {
+      const filePath = join(agentsDir, `${inputData.name}.ts`);
       const source = readFileSafe(filePath);
       if (!source) {
-        return { success: false, message: `Agent "${context.name}" not found.` };
+        return { success: false, message: `Agent "${inputData.name}" not found.` };
       }
 
       let updated = source;
-      if (context.field === 'instructions') {
+      if (inputData.field === 'instructions') {
         // Replace the template-literal instructions block
         updated = source.replace(
           /instructions:\s*`[^`]*`/s,
-          `instructions: \`${context.value.replace(/`/g, '\\`')}\``,
+          `instructions: \`${inputData.value.replace(/`/g, '\\`')}\``,
         );
-      } else if (context.field === 'model') {
-        updated = source.replace(/model:\s*'[^']*'/, `model: '${context.value}'`);
-      } else if (context.field === 'description') {
+      } else if (inputData.field === 'model') {
+        updated = source.replace(/model:\s*'[^']*'/, `model: '${inputData.value}'`);
+      } else if (inputData.field === 'description') {
         // Update the JSDoc comment at the top of the file
         updated = source.replace(
           /\/\/ .+\n \* .+/,
-          `// Extension agent: ${context.name}\n * ${context.value}`,
+          `// Extension agent: ${inputData.name}\n * ${inputData.value}`,
         );
       }
 
       writeFileSync(filePath, updated, 'utf8');
-      return { success: true, path: filePath, message: `Updated "${context.field}" on agent "${context.name}". Call reload_ecosystem to apply.` };
+      return { success: true, path: filePath, message: `Updated "${inputData.field}" on agent "${inputData.name}". Call reload_ecosystem to apply.` };
     },
   });
 
@@ -153,21 +153,21 @@ export function createEnvironmentTools(
         .default('other')
         .describe('Permission category for the tool'),
     }),
-    execute: async ({ context }) => {
+    execute: async (inputData) => {
       ensureDir(toolsDir);
-      const filePath = join(toolsDir, `${context.name}.ts`);
+      const filePath = join(toolsDir, `${inputData.name}.ts`);
       if (existsSync(filePath)) {
-        return { success: false, message: `Tool "${context.name}" already exists. Use edit_tool to modify it.` };
+        return { success: false, message: `Tool "${inputData.name}" already exists. Use edit_tool to modify it.` };
       }
       const source = renderToolTemplate(
-        context.name,
-        context.description,
-        context.inputSchema,
-        context.implementation,
-        context.category,
+        inputData.name,
+        inputData.description,
+        inputData.inputSchema,
+        inputData.implementation,
+        inputData.category ?? 'other',
       );
       writeFileSync(filePath, source, 'utf8');
-      return { success: true, path: filePath, message: `Created tool "${context.name}". Call reload_ecosystem to activate it.` };
+      return { success: true, path: filePath, message: `Created tool "${inputData.name}". Call reload_ecosystem to activate it.` };
     },
   });
 
@@ -181,34 +181,34 @@ export function createEnvironmentTools(
       field: z.enum(['description', 'implementation', 'category']).describe('Which field to update'),
       value: z.string().describe('New value for the field'),
     }),
-    execute: async ({ context }) => {
-      const filePath = join(toolsDir, `${context.name}.ts`);
+    execute: async (inputData) => {
+      const filePath = join(toolsDir, `${inputData.name}.ts`);
       const source = readFileSafe(filePath);
       if (!source) {
-        return { success: false, message: `Tool "${context.name}" not found.` };
+        return { success: false, message: `Tool "${inputData.name}" not found.` };
       }
 
       let updated = source;
-      if (context.field === 'description') {
+      if (inputData.field === 'description') {
         updated = source.replace(
           /description:\s*`[^`]*`/,
-          `description: \`${context.value.replace(/`/g, '\\`')}\``,
+          `description: \`${inputData.value.replace(/`/g, '\\`')}\``,
         );
-      } else if (context.field === 'implementation') {
+      } else if (inputData.field === 'implementation') {
         // Replace the entire execute body
         updated = source.replace(
           /execute:\s*async\s*\(\{\s*context\s*\}\)\s*=>\s*\{[^}]*\}/s,
-          `execute: async ({ context }) => {\n    ${context.value}\n  }`,
+          `execute: async ({ context }) => {\n    ${inputData.value}\n  }`,
         );
-      } else if (context.field === 'category') {
+      } else if (inputData.field === 'category') {
         updated = source.replace(
           /export const category = '[^']*' as const;/,
-          `export const category = '${context.value}' as const;`,
+          `export const category = '${inputData.value}' as const;`,
         );
       }
 
       writeFileSync(filePath, updated, 'utf8');
-      return { success: true, path: filePath, message: `Updated "${context.field}" on tool "${context.name}". Call reload_ecosystem to apply.` };
+      return { success: true, path: filePath, message: `Updated "${inputData.field}" on tool "${inputData.name}". Call reload_ecosystem to apply.` };
     },
   });
 

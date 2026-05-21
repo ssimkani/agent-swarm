@@ -138,10 +138,10 @@ const activeClients = new Map<string, StdioMcpClient>();
 export async function loadMcp(config: Config): Promise<McpToolsets> {
   const toolsets: McpToolsets = {};
 
-  for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
+  for (const [serverName, serverConfig] of Object.entries(config.mcpServers) as [string, { command: string; args?: string[]; env?: Record<string, string> }][]) {
     try {
       // Spawn the MCP server process
-      const proc = spawn(serverConfig.command, serverConfig.args, {
+      const proc = spawn(serverConfig.command, serverConfig.args ?? [], {
         stdio: ['pipe', 'pipe', 'inherit'], // pipe stdin/stdout, inherit stderr for logs
         env: { ...process.env, ...serverConfig.env },
       });
