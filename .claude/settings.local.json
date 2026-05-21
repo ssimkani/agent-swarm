@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(node bin/agent.js --help)",
+      "Bash(node bin/agent.js --version)",
+      "Bash(timeout 5 node bin/agent.js)",
+      "Bash(node bin/agent.js)",
+      "Bash(env)",
+      "Bash(cat ~/.config/terminal-agent/config.json 2>/dev/null || echo \"\\(no user config\\)\")",
+      "Read(//Users/seena/.config/terminal-agent/**)"
+    ]
+  }
+}

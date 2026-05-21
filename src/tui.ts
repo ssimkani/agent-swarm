@@ -21,7 +21,7 @@
 
 import * as readline from 'node:readline';
 import pc from 'picocolors';
-import type { Harness, HarnessEvent, HarnessDisplayState } from '@mastra/core/harness';
+import type { Harness, HarnessEvent } from '@mastra/core/harness';
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
 
@@ -93,13 +93,12 @@ Available slash commands:
  * Subscribes to Harness events to update the display, then opens a readline
  * interface for user input. Returns when the user types /quit or presses Ctrl-C.
  *
- * @param harness     - The initialised Harness instance
- * @param onRebuild   - Called by reload_ecosystem to swap the harness reference
+ * Harness rebuilds (triggered by reload_ecosystem) are handled via the
+ * `onHarnessRebuilt` callback passed to `createHarness`, not through the TUI.
+ *
+ * @param harness - The initialised Harness instance
  */
-export async function runTui(
-  harness: Harness,
-  onRebuild?: (newHarness: Harness) => void,
-): Promise<void> {
+export async function runTui(harness: Harness): Promise<void> {
   // Track the active harness reference; reload_ecosystem may swap it
   let activeHarness = harness;
 
@@ -116,6 +115,8 @@ export async function runTui(
         // ── Message streaming ──────────────────────────────────────────────
         case 'message_start':
           if (event.message.role === 'assistant') {
+            // Stop any spinner that was running (subagent, thinking, etc.)
+            spinner.stop();
             isStreaming = true;
             currentMessageText = '';
             process.stdout.write(pc.cyan('\nAssistant: '));
@@ -151,15 +152,9 @@ export async function runTui(
           break;
 
         case 'subagent_end':
-          // After a subagent ends, the review step runs for edit-access subagents.
-          // The spinner label change signals to the user that review is in progress.
-          spinner.update('reviewing…');
-          // The spinner stops when the next message_start arrives
-          break;
-
-        case 'message_start':
-          // Assistant message incoming — the review has completed, stop spinner
-          spinner.stop();
+          // Subagent finished. The spinner keeps running until the next
+          // message_start (which signals the router's response has begun).
+          spinner.update('thinking…');
           break;
 
         // ── Tool approval ──────────────────────────────────────────────────

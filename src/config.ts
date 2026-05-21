@@ -36,7 +36,7 @@ const McpServerSchema = z.object({
  */
 const ConfigSchema = z.object({
   /** Default model ID used when no per-mode override is set. */
-  model: z.string().default('anthropic/claude-sonnet-4-20250514'),
+  model: z.string().default('openrouter/deepseek/deepseek-v4-flash'),
 
   /** Per-mode model overrides — only the modes you want to customise need entries. */
   modeModels: z.object({
@@ -58,10 +58,15 @@ const ConfigSchema = z.object({
    * - mcp: MCP server tool calls — ask by default
    */
   permissions: z.object({
-    read: PermissionPolicySchema.default('allow'),
-    edit: PermissionPolicySchema.default('ask'),
-    execute: PermissionPolicySchema.default('ask'),
-    mcp: PermissionPolicySchema.default('ask'),
+    read: PermissionPolicySchema,
+    edit: PermissionPolicySchema,
+    execute: PermissionPolicySchema,
+    mcp: PermissionPolicySchema,
+  }).default({
+      read: 'allow',
+      edit: 'ask',
+      execute: 'ask',
+      mcp: 'ask',
   }),
 
   /** Root directory where user-authored extension agents/tools live. */
@@ -74,7 +79,7 @@ const ConfigSchema = z.object({
    * Defaults to a small/fast model — the reviewer only needs to classify output,
    * not produce complex reasoning.
    */
-  reviewerModel: z.string().default('anthropic/claude-haiku-4-5-20251001'),
+  reviewerModel: z.string().default('openrouter/deepseek/deepseek-v4-flash'),
 });
 
 // ── Exported types ────────────────────────────────────────────────────────────
@@ -104,6 +109,26 @@ function deepMerge(base: unknown, override: unknown): unknown {
   return result;
 }
 
+
+// function for merging permissions issues
+function stripUndefinedDeep(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(stripUndefinedDeep);
+  }
+
+  if (!obj || typeof obj !== 'object') {
+    return obj;
+  }
+
+  const out: any = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) {
+      out[k] = stripUndefinedDeep(v);
+    }
+  }
+  return out;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -119,5 +144,9 @@ export async function loadConfig(): Promise<Config> {
 
   // Layer: defaults → user config → project config
   const merged = deepMerge(deepMerge({}, userConfig), projectConfig);
-  return ConfigSchema.parse(merged);
+
+  // cleaned merge
+  const cleaned = stripUndefinedDeep(merged);
+
+  return ConfigSchema.parse(cleaned);
 }

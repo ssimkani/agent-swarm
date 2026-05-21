@@ -1,36 +1,29 @@
 /**
- * Harness factory — Steps 9 + 8 (subagent review wrapper)
+ * Harness factory — Step 9
  *
- * This is the central assembly point. It takes config, registry, and MCP
- * toolsets, then constructs and returns a fully configured Harness instance.
+ * Central assembly point. Takes config, registry, and MCP toolsets and returns
+ * a fully configured Harness instance ready for `init()`.
  *
- * Key responsibilities:
+ * Responsibilities:
+ *   1. Build four modes (chat / plan / build / create_environment), each
+ *      backed by the matching router agent variant.
+ *   2. Register all four subagent types with the Harness's built-in subagent tool.
+ *   3. Wire permission policies from config.
+ *   4. Expose /create_environment meta-tools to all agents (the router's
+ *      instructions gate which mode may actually call them).
+ *   5. On reload_ecosystem, build a fresh Harness and call `onHarnessRebuilt`
+ *      so the CLI can swap its `activeHarness` reference without restarting.
  *
- *   1. Build four Harness modes (chat / plan / build / create_environment),
- *      each backed by the matching router agent variant.
- *
- *   2. Register all four subagent types (explore, edit, execute, plan) and
- *      wrap the subagent tool so that edit-access subagents (edit, execute)
- *      have their output reviewed by the dynamic agent before the router sees it.
- *
- *   3. Wire permission policies from config into the Harness.
- *
- *   4. Expose the create_environment meta-tools only in that mode via the
- *      `tools` config (DynamicArgument keyed on mode ID).
- *
- * Dynamic review interception:
- *   The Harness's built-in `subagent` tool is disabled via `disableBuiltinTools`.
- *   A custom replacement is provided in `tools` that:
- *     a) calls `createSubagentTool` (Mastra's official factory) to get the
- *        standard subagent spawning logic, including all display-state events;
- *     b) wraps that tool's execute function so that, after an edit-access
- *        subagent completes, the raw output is piped through `reviewOutput`
- *        before being returned to the router.
+ * Dynamic review:
+ *   The dynamic reviewer agent (src/agents/dynamic.ts) is intentionally not
+ *   wired here yet. It will be connected when re-enabled.
  */
 
 import { Harness } from '@mastra/core/harness';
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod/v4';
+import type { ToolCategory, PermissionPolicy } from '@mastra/core/harness';
+import type { ToolAction } from '@mastra/core/tools';
 import type { Config } from './config.js';
 import type { Registry } from './registry.js';
 import type { McpToolsets } from './mcp.js';
@@ -38,8 +31,6 @@ import { resolveModel } from './models.js';
 import { createStorage, createMemory } from './workspace.js';
 import { createRouterAgents, subagentDefinitions } from './agents/router.js';
 import { createEnvironmentTools } from './tools/create-environment.js';
-import type { ToolCategory, PermissionPolicy, HarnessSubagent } from '@mastra/core/harness';
-import type { ToolAction } from '@mastra/core/tools';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -49,10 +40,9 @@ export interface HarnessFactoryInput {
   registry: Registry;
   mcp: McpToolsets;
   /**
-   * Called by reload_ecosystem after the registry is refreshed and a new
-   * Harness instance is built and initialised.
-   * The CLI uses this to swap its activeHarness reference so the TUI
-   * continues to work without restarting.
+   * Called after reload_ecosystem builds and initialises a fresh Harness.
+   * The CLI uses this to swap its `activeHarness` reference in-place so the
+   * TUI continues working with the new agents/tools without a full restart.
    */
   onHarnessRebuilt?: (newHarness: Harness) => Promise<void>;
 }
@@ -60,8 +50,8 @@ export interface HarnessFactoryInput {
 // ── Permission policy bridging ────────────────────────────────────────────────
 
 /**
- * Maps the config permission policy strings to the Harness PermissionPolicy type.
- * They share the same string values, but this explicit cast makes the dependency clear.
+ * Maps the config permission strings to the Harness PermissionPolicy type.
+ * Both use the same string literals; this cast makes the dependency explicit.
  */
 function toPermissionPolicy(p: string): PermissionPolicy {
   return p as PermissionPolicy;
@@ -72,18 +62,13 @@ function toPermissionPolicy(p: string): PermissionPolicy {
 /**
  * Tells the Harness which permission bucket each tool name belongs to.
  *
- * The Harness uses this to:
- *   - Apply category-level permission policies (allow / ask / deny)
- *   - Show the right label in tool-approval prompts
- *
- * Naming conventions:
- *   - MCP tools are namespaced as "<server>__<tool>", so we check for "__"
- *   - Extension tools carry a `category` field in the registry
- *   - Built-in harness tools (ask_user, submit_plan, task_*) fall through to null
- *     (the Harness handles those itself)
+ * Resolution order:
+ *   1. MCP tools — name contains "__" (e.g. "github__create_issue")
+ *   2. Extension tools — explicit `category` export from the tool file
+ *   3. Workspace tools — conventional prefixes (fs_, read_, write_, exec_, …)
+ *   4. Everything else — null (Harness treats as 'other')
  */
 function buildToolCategoryResolver(registry: Registry) {
-  // Pre-build a lookup map from tool ID → category for O(1) resolution
   const toolCategoryMap = new Map<string, ToolCategory>(
     registry.tools
       .filter(t => t.category)
@@ -91,11 +76,8 @@ function buildToolCategoryResolver(registry: Registry) {
   );
 
   return (toolName: string): ToolCategory | null => {
-    // MCP tools are always in the 'mcp' category
     if (toolName.includes('__')) return 'mcp';
-    // Extension tool with an explicit category
     if (toolCategoryMap.has(toolName)) return toolCategoryMap.get(toolName)!;
-    // Workspace tools by convention
     if (toolName.startsWith('fs_') || toolName.startsWith('read_')) return 'read';
     if (toolName.startsWith('write_') || toolName.startsWith('edit_') || toolName.startsWith('delete_')) return 'edit';
     if (toolName.startsWith('exec_') || toolName.startsWith('run_') || toolName.startsWith('shell_')) return 'execute';
@@ -106,17 +88,21 @@ function buildToolCategoryResolver(registry: Registry) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Assembles and returns a fully configured Harness instance.
+ * Assembles and returns a fully configured Harness instance plus a `rebuild`
+ * helper that re-creates the harness after the registry changes.
  *
- * The harness is not yet initialised when this function returns — call
- * `harness.init()` before using it.
+ * The returned harness is NOT yet initialised — call `harness.init()` and
+ * `harness.selectOrCreateThread()` before sending messages.
  *
- * @param input - Config, registry, and MCP toolsets
- * @returns     - Configured Harness + a `rebuild()` helper for /create_environment
+ * @param input - Config, registry, MCP toolsets, and optional rebuilt callback
  */
 export async function createHarness(input: HarnessFactoryInput): Promise<{
   harness: Harness;
-  /** Re-creates the harness after registry.reload() — returns the new instance. */
+  /**
+   * Re-scans the extensions directory, builds a fresh Harness with the
+   * updated registry, initialises it, and returns it.
+   * Also calls `input.onHarnessRebuilt` if provided.
+   */
   rebuild: () => Promise<{ harness: Harness }>;
 }> {
   const { config, registry, mcp } = input;
@@ -124,17 +110,17 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
   const storage = createStorage();
   const memory = createMemory(storage);
 
-  // Build the four router agents, each with the current registry summary baked in
+  // Build the four router agents with the current registry summary baked in
   const { chatAgent, planAgent, buildAgent, createEnvAgent } = createRouterAgents(
     registry,
     config.model,
   );
 
-  // Flatten MCP toolsets into a single tools record namespaced by server
+  // Flatten MCP toolsets into a single namespaced tools record
   const mcpTools: Record<string, ToolAction<unknown, unknown>> = {};
   for (const serverTools of Object.values(mcp)) {
-    for (const [id, tool] of Object.entries(serverTools)) {
-      mcpTools[id] = createTool({
+    for (const tool of Object.values(serverTools)) {
+      mcpTools[tool.id] = createTool({
         id: tool.id,
         description: tool.description,
         inputSchema: tool.inputSchema ?? z.object({}),
@@ -143,24 +129,25 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
     }
   }
 
-  // Flatten extension registry tools into the same record
+  // Flatten extension registry tools
   const extensionTools: Record<string, ToolAction<unknown, unknown>> = {};
   for (const { id, tool } of registry.tools) {
     extensionTools[id] = tool as unknown as ToolAction<unknown, unknown>;
   }
 
-  // /create_environment meta-tools
-  let envTools = createEnvironmentTools(registry, config, async () => {
-    // Called by reload_ecosystem; for now, a no-op
-  });
+  // /create_environment meta-tools — placeholder until build() is defined below
+  let envTools = createEnvironmentTools(registry, config, async () => { /* rewired below */ });
 
-  function build() {
+  /**
+   * Inner factory that creates a Harness from the current closed-over values.
+   * Called once at startup and again by reload_ecosystem / rebuild().
+   */
+  function build(): Harness {
     const harness = new Harness({
       id: 'agent-swarm',
       storage,
       memory,
 
-      // Four harness modes
       modes: [
         {
           id: 'chat',
@@ -193,54 +180,47 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
         },
       ],
 
-      // Subagent definitions
+      // Subagent definitions drive the built-in `subagent` tool's description
+      // and the display-state events (subagent_start / subagent_end).
       subagents: subagentDefinitions,
 
-      // Use the built-in subagent tool (no custom wrapping for now)
-
-      /**
-       * Tools available to agents.
-       * All extension tools, MCP tools, and meta-tools are always present.
-       * The router agents' instructions (per-mode) control which tools they actually use.
-       * Meta-tools are only meaningful in /create_environment mode anyway.
-       */
+      // All tools merged: extension, MCP, and create_environment meta-tools.
+      // The router agents' instructions determine which tools each mode uses.
       tools: {
         ...extensionTools,
         ...mcpTools,
-        // Use the built-in subagent tool without custom wrapping for now
-        // Meta-tools for /create_environment
-        create_agent: envTools.create_agent as unknown as ToolAction<unknown, unknown>,
-        edit_agent: envTools.edit_agent as unknown as ToolAction<unknown, unknown>,
-        create_tool: envTools.create_tool as unknown as ToolAction<unknown, unknown>,
-        edit_tool: envTools.edit_tool as unknown as ToolAction<unknown, unknown>,
-        list_agents: envTools.list_agents as unknown as ToolAction<unknown, unknown>,
-        list_tools: envTools.list_tools as unknown as ToolAction<unknown, unknown>,
-        show_registry: envTools.show_registry as unknown as ToolAction<unknown, unknown>,
+        create_agent:     envTools.create_agent     as unknown as ToolAction<unknown, unknown>,
+        edit_agent:       envTools.edit_agent       as unknown as ToolAction<unknown, unknown>,
+        create_tool:      envTools.create_tool      as unknown as ToolAction<unknown, unknown>,
+        edit_tool:        envTools.edit_tool        as unknown as ToolAction<unknown, unknown>,
+        list_agents:      envTools.list_agents      as unknown as ToolAction<unknown, unknown>,
+        list_tools:       envTools.list_tools       as unknown as ToolAction<unknown, unknown>,
+        show_registry:    envTools.show_registry    as unknown as ToolAction<unknown, unknown>,
         reload_ecosystem: envTools.reload_ecosystem as unknown as ToolAction<unknown, unknown>,
       } as Record<string, ToolAction<unknown, unknown>>,
 
-      // Model resolver used by subagents and OM
       resolveModel,
-
-      // Maps tool names to permission categories for the approval system
       toolCategoryResolver: buildToolCategoryResolver(registry),
     });
 
-    // Apply permission policies from config
-    harness.setPermissionForCategory({ category: 'read', policy: toPermissionPolicy(config.permissions.read) });
-    harness.setPermissionForCategory({ category: 'edit', policy: toPermissionPolicy(config.permissions.edit) });
+    // Apply per-category permission policies from config
+    harness.setPermissionForCategory({ category: 'read',    policy: toPermissionPolicy(config.permissions.read) });
+    harness.setPermissionForCategory({ category: 'edit',    policy: toPermissionPolicy(config.permissions.edit) });
     harness.setPermissionForCategory({ category: 'execute', policy: toPermissionPolicy(config.permissions.execute) });
-    harness.setPermissionForCategory({ category: 'mcp', policy: toPermissionPolicy(config.permissions.mcp) });
+    harness.setPermissionForCategory({ category: 'mcp',     policy: toPermissionPolicy(config.permissions.mcp) });
 
     return harness;
   }
 
-  // Wire up the reload callback now that build() is defined
+  // ── Wire the real reload callback now that build() is in scope ────────────
+  // Re-assign envTools with an onReload that:
+  //   1. Builds a fresh Harness with the updated registry
+  //   2. Initialises it (connects to storage)
+  //   3. Notifies the CLI via input.onHarnessRebuilt so it can swap activeHarness
   envTools = createEnvironmentTools(registry, config, async () => {
-    // After reload_ecosystem, rebuild the harness so new agents/tools are live
     const newHarness = build();
     await newHarness.init();
-    // The TUI holds a reference via `rebuild()` (see CLI entrypoint)
+    await input.onHarnessRebuilt?.(newHarness);
   });
 
   const harness = build();
@@ -248,8 +228,11 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
   return {
     harness,
     rebuild: async () => {
+      // Re-scan extensions, rebuild, init, notify
       await registry.reload();
       const newHarness = build();
+      await newHarness.init();
+      await input.onHarnessRebuilt?.(newHarness);
       return { harness: newHarness };
     },
   };

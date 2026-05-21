@@ -26,6 +26,7 @@ import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { Harness } from '@mastra/core/harness';
 import { ensureProjectDir } from './workspace.js';
 import { loadConfig } from './config.js';
 import { loadRegistry } from './registry.js';
@@ -124,10 +125,23 @@ export async function main(): Promise<void> {
   const registry = await loadRegistry(config);
   const mcp = await loadMcp(config);
 
-  const { harness, rebuild } = await createHarness({ config, registry, mcp });
+  // Track the active harness — swapped by onHarnessRebuilt when reload_ecosystem fires
+  let activeHarness: Harness;
 
-  // Track the active harness — may be swapped by reload_ecosystem
-  let activeHarness = harness;
+  const { harness } = await createHarness({
+    config,
+    registry,
+    mcp,
+    // Called by reload_ecosystem after the new harness is built and initialised.
+    // Destroys the old instance and promotes the new one as the active harness.
+    onHarnessRebuilt: async (newHarness: Harness) => {
+      const prev = activeHarness;
+      activeHarness = newHarness;
+      try { await prev.destroy(); } catch { /* best-effort */ }
+    },
+  });
+
+  activeHarness = harness;
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
 
@@ -149,10 +163,7 @@ export async function main(): Promise<void> {
   await activeHarness.init();
   await activeHarness.selectOrCreateThread();
 
-  await runTui(activeHarness, (newHarness) => {
-    // Called by the TUI when reload_ecosystem swaps the harness
-    activeHarness = newHarness;
-  });
+  await runTui(activeHarness);
 
   // runTui resolves when the user types /quit
   await shutdown();
