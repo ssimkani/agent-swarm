@@ -38,6 +38,7 @@ export function createStorage(): LibSQLStore {
   mkdirSync(agentDir, { recursive: true });
 
   return new LibSQLStore({
+    id: join(agentDir, 'data.db'),
     url: `file:${join(agentDir, 'data.db')}`,
   });
 }
