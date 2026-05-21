@@ -1,25 +1,27 @@
 /**
- * CLI entrypoint — Step 13
+ * CLI entrypoint
  *
  * Top-level orchestration for the `agent` binary.
  *
  * Startup sequence:
- *   1. Parse argv (--help, --version, --cwd)
- *   2. ensureProjectDir()   — create .agent/ if needed
- *   3. loadConfig()         — merge user + project config
- *   4. loadRegistry()       — scan extensions/ for agents and tools
- *   5. loadMcp()            — spawn configured MCP servers
- *   6. createHarness()      — assemble the Harness with all modes
- *   7. harness.init()       — connect to storage
- *   8. selectOrCreateThread — load or create a conversation thread
- *   9. runTui()             — start the interactive REPL
+ *   1. Parse argv (--help, --version, --cwd, --model)
+ *   2. ensureProjectDir()        — create .agent/ if needed
+ *   3. loadConfig()              — merge user + project config
+ *   4. Apply --model override    — overrides all per-mode models if set
+ *   5. loadRegistry()            — scan extensions/ for agents and tools
+ *   6. loadMcp()                 — spawn configured MCP servers
+ *   7. createHarness()           — assemble the Harness with all modes
+ *   8. harness.init()            — connect to storage
+ *   9. selectOrCreateThread      — load or create a conversation thread
+ *  10. runTui()                  — start the interactive REPL
  *
- * SIGINT (Ctrl-C) triggers a clean shutdown:
+ * SIGINT / SIGTERM trigger a clean shutdown:
  *   - harness.destroy()   — closes open DB connections
  *   - shutdownMcp()       — SIGTERMs all MCP child processes
  *
- * The `--cwd` flag lets users point the agent at a different project directory
- * than the shell's current directory, which is useful for IDE integrations.
+ * Flags:
+ *   --cwd  / -C  Point the agent at a different project directory
+ *   --model / -m Override the model for all modes (any Mastra provider string)
  */
 
 import { parseArgs } from 'node:util';
@@ -36,7 +38,6 @@ import { runTui } from './tui.js';
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-/** Reads the version from package.json at build time. */
 function readVersion(): string {
   try {
     const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
@@ -55,32 +56,42 @@ function parseArgv() {
       help:    { type: 'boolean', short: 'h', default: false },
       version: { type: 'boolean', short: 'v', default: false },
       cwd:     { type: 'string',  short: 'C' },
+      model:   { type: 'string',  short: 'm' },
     },
     strict: false,
     allowPositionals: true,
   });
-  return values as { help?: boolean; version?: boolean; cwd?: string };
+  return values as { help?: boolean; version?: boolean; cwd?: string; model?: string };
 }
 
 const HELP_TEXT = `
 Usage: agent [options]
 
 Options:
-  -h, --help       Show this help message
-  -v, --version    Print the version number
-  -C, --cwd <dir>  Use a different project directory (default: current directory)
+  -h, --help           Show this help message
+  -v, --version        Print the version number
+  -C, --cwd <dir>      Use a different project directory (default: current directory)
+  -m, --model <id>     Override the model for all modes
+
+Model providers (format: <provider>/<model>):
+  anthropic/<model>             ANTHROPIC_API_KEY
+  openai/<model>                OPENAI_API_KEY
+  google/<model>                GOOGLE_GENERATIVE_AI_API_KEY
+  openrouter/<provider>/<model> OPENROUTER_API_KEY
+  ollama/<model>                local — no key needed
+  lmstudio/<model>              local — no key needed
+  groq/<model>                  GROQ_API_KEY
+
+Examples:
+  agent --model anthropic/claude-sonnet-4-20250514
+  agent --model ollama/llama3.2
+  agent --model openrouter/deepseek/deepseek-v4-flash
 
 Modes (switch with slash commands inside the REPL):
   /chat               Conversational assistant (read-only)
   /plan               Research and structured planning
   /build              Full implementation with file editing
   /create_environment Create and manage agent/tool extensions
-
-Environment variables (one per provider):
-  ANTHROPIC_API_KEY   — anthropic/* models
-  OPENAI_API_KEY      — openai/* models
-  GOOGLE_GENERATIVE_AI_API_KEY — google/* models
-  OPENROUTER_API_KEY  — openrouter/* models
 
 Configuration files:
   ~/.config/terminal-agent/config.json   User-level config
@@ -92,85 +103,94 @@ Data:
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-/**
- * Entry point — called by bin/agent.js.
- *
- * All errors are caught and printed before exiting with code 1
- * so the shell always sees a clean exit status.
- */
 export async function main(): Promise<void> {
   const args = parseArgv();
 
-  if (args.help) {
-    console.log(HELP_TEXT);
-    process.exit(0);
-  }
+  if (args.help)    { console.log(HELP_TEXT); process.exit(0); }
+  if (args.version) { console.log(readVersion()); process.exit(0); }
 
-  if (args.version) {
-    console.log(readVersion());
-    process.exit(0);
-  }
+  if (args.cwd) process.chdir(args.cwd);
 
-  // Allow the user to point the agent at a different directory
-  if (args.cwd) {
-    process.chdir(args.cwd);
-  }
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
 
-  // ── Bootstrap ─────────────────────────────────────────────────────────────
-
-  // Create .agent/ before anything tries to read/write inside it
   ensureProjectDir();
 
   const config = await loadConfig();
-  const registry = await loadRegistry(config);
-  const mcp = await loadMcp(config);
 
-  // Track the active harness — swapped by onHarnessRebuilt when reload_ecosystem fires
+  // --model overrides the default model and clears per-mode overrides so the
+  // flag applies uniformly across all modes.
+  if (args.model) {
+    config.model      = args.model;
+    config.modeModels = {};
+  }
+
+  const registry = await loadRegistry(config);
+  const mcp      = await loadMcp(config);
+
+  // ── Harness-change notification ────────────────────────────────────────────
+
+  // The TUI registers a handler here so it can resubscribe when the harness is
+  // swapped by reload_ecosystem or by /load-env in the TUI itself.
+  let tuiHarnessHandler: ((h: Harness) => void) | undefined;
+
   let activeHarness: Harness;
 
-  const { harness } = await createHarness({
+  const { harness, rebuild } = await createHarness({
     config,
     registry,
     mcp,
-    // Called by reload_ecosystem after the new harness is built and initialised.
-    // Destroys the old instance and promotes the new one as the active harness.
     onHarnessRebuilt: async (newHarness: Harness) => {
       const prev = activeHarness;
+      const prevModeId = prev.getCurrentModeId();
       activeHarness = newHarness;
+      // Notify TUI first so it resubscribes before any mode/model events fire
+      tuiHarnessHandler?.(newHarness);
+      // Restore the mode the user was in before the reload
+      try {
+        if (prevModeId && prevModeId !== newHarness.getCurrentModeId()) {
+          await newHarness.switchMode({ modeId: prevModeId });
+        }
+      } catch { /* best-effort */ }
       try { await prev.destroy(); } catch { /* best-effort */ }
     },
   });
 
   activeHarness = harness;
 
-  // ── Graceful shutdown ─────────────────────────────────────────────────────
+  // ── Graceful shutdown ──────────────────────────────────────────────────────
 
   async function shutdown() {
     console.log('\nShutting down…');
-    try {
-      await activeHarness.destroy();
-    } catch { /* best-effort */ }
+    try { await activeHarness.destroy(); } catch { /* best-effort */ }
     shutdownMcp();
     process.exit(0);
   }
 
-  // Register once; subsequent Ctrl-C calls force-exit after the first one queues
-  process.once('SIGINT', () => { void shutdown(); });
+  process.once('SIGINT',  () => { void shutdown(); });
   process.once('SIGTERM', () => { void shutdown(); });
 
-  // ── Initialise and run ────────────────────────────────────────────────────
+  // ── Initialise and run ─────────────────────────────────────────────────────
 
   await activeHarness.init();
   await activeHarness.selectOrCreateThread();
 
-  await runTui(activeHarness);
+  // Apply --model flag to all modes in the active thread so it beats persisted values.
+  if (args.model) {
+    for (const modeId of ['chat', 'plan', 'build', 'create_environment']) {
+      await activeHarness.switchModel({ modelId: args.model, modeId });
+    }
+  }
 
-  // runTui resolves when the user types /quit
+  await runTui(
+    activeHarness,
+    config,
+    rebuild,
+    (handler) => { tuiHarnessHandler = handler; },
+  );
+
   await shutdown();
 }
 
-// Allow running directly as a module for development
-// e.g. `tsx src/cli.ts`
 main().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);

@@ -140,15 +140,18 @@ export function createEnvironmentTools(
       name: z.string().describe('Tool name/ID (no extension)'),
       description: z.string().describe('One-line description of what the tool does'),
       /**
-       * Raw Zod field definitions that go inside z.object({ ... }).
-       * Example: `url: z.string().url(), timeout: z.number().optional()`
+       * The full z.object() expression — NOT just the fields inside it.
+       * Examples:
+       *   no inputs:  z.object({})
+       *   one field:  z.object({ url: z.string() })
+       *   multiple:   z.object({ query: z.string(), limit: z.number().default(10) })
        */
-      inputSchema: z.string().describe('Zod field definitions for the input schema'),
+      inputSchema: z.string().describe('Full z.object() expression for the tool\'s inputs. For no inputs use z.object({}). For inputs: z.object({ fieldName: z.string() }).'),
       /**
-       * The async function body inserted inside execute: async ({ context }) => { ... }.
-       * Must be valid TypeScript; `context` is typed as the inferred schema.
+       * The async function body inside execute: async (inputData) => { ... }.
+       * Access input fields via inputData.fieldName.
        */
-      implementation: z.string().describe('Function body for the execute handler'),
+      implementation: z.string().describe('Async function body. Access input fields via inputData.fieldName. Must return a plain object or value.'),
       category: z.enum(['read', 'edit', 'execute', 'mcp', 'other'])
         .default('other')
         .describe('Permission category for the tool'),
@@ -195,10 +198,10 @@ export function createEnvironmentTools(
           `description: \`${inputData.value.replace(/`/g, '\\`')}\``,
         );
       } else if (inputData.field === 'implementation') {
-        // Replace the entire execute body
+        // Replace the entire execute body (matches both legacy { context } and current inputData signatures)
         updated = source.replace(
-          /execute:\s*async\s*\(\{\s*context\s*\}\)\s*=>\s*\{[^}]*\}/s,
-          `execute: async ({ context }) => {\n    ${inputData.value}\n  }`,
+          /execute:\s*async\s*\([^)]*\)\s*=>\s*\{[\s\S]*?\n  \},/,
+          `execute: async (inputData) => {\n    ${inputData.value}\n  },`,
         );
       } else if (inputData.field === 'category') {
         updated = source.replace(

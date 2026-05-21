@@ -1,14 +1,11 @@
 /**
- * Tool file template — Step 12
+ * Tool file template
  *
  * String template used by the `create_tool` meta-tool.
- * Placeholders replaced before writing to disk:
  *
- *   __NAME__           → tool ID / filename stem
- *   __DESCRIPTION__    → one-line description for the registry
- *   __SCHEMA__         → Zod schema body (the fields inside z.object({ ... }))
- *   __IMPLEMENTATION__ → async function body (the code that runs inside execute)
- *   __CATEGORY__       → 'read' | 'edit' | 'execute' | 'mcp' | 'other'
+ * The `inputSchema` parameter is a full `z.object(...)` expression — the agent
+ * writes the complete schema, not just the fields inside it. This prevents the
+ * common mistake of wrapping an already-complete schema in another z.object().
  *
  * The generated file:
  *   - Default-exports a Mastra Tool (createTool result)
@@ -17,22 +14,22 @@
  */
 
 /**
- * Returns the source code for a new tool extension file.
+ * Returns the
+ * source code for a new tool extension file.
  *
  * @param name           - Tool identifier (used as the `id` field)
  * @param description    - Short description shown in registry and tool approval prompts
- * @param schemaFields   - Raw Zod field definitions, e.g. `url: z.string()`
- * @param implementation - Async function body; receives `context` typed as the schema
+ * @param inputSchema    - Full z.object() expression, e.g. `z.object({ url: z.string() })`
+ * @param implementation - Async function body; access inputs via inputData.fieldName
  * @param category       - Permission category controlling approval policy
  */
 export function renderToolTemplate(
   name: string,
   description: string,
-  schemaFields: string,
+  inputSchema: string,
   implementation: string,
   category: 'read' | 'edit' | 'execute' | 'mcp' | 'other',
 ): string {
-  // Escape backticks so the description survives inside a template literal
   const escapedDescription = description.replace(/`/g, '\\`');
 
   return `/**
@@ -46,19 +43,13 @@ export function renderToolTemplate(
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod/v4';
 
-/**
- * Permission category: '${category}'
- * The registry reads this export to assign the correct approval policy.
- */
 export const category = '${category}' as const;
 
 const tool = createTool({
   id: '${name}',
   description: \`${escapedDescription}\`,
-  inputSchema: z.object({
-    ${schemaFields}
-  }),
-  execute: async ({ context }) => {
+  inputSchema: ${inputSchema},
+  execute: async (inputData) => {
     ${implementation}
   },
 });

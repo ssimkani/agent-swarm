@@ -220,6 +220,8 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
   envTools = createEnvironmentTools(registry, config, async () => {
     const newHarness = build();
     await newHarness.init();
+    // Restore the active thread so the conversation continues after reload
+    await newHarness.selectOrCreateThread();
     await input.onHarnessRebuilt?.(newHarness);
   });
 
@@ -228,10 +230,10 @@ export async function createHarness(input: HarnessFactoryInput): Promise<{
   return {
     harness,
     rebuild: async () => {
-      // Re-scan extensions, rebuild, init, notify
       await registry.reload();
       const newHarness = build();
       await newHarness.init();
+      await newHarness.selectOrCreateThread();
       await input.onHarnessRebuilt?.(newHarness);
       return { harness: newHarness };
     },
